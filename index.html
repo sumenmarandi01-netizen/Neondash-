@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Neon Dash</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body style="margin:0;background:#030609">
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+</body>
+</html>
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ── RESPONSIVE DIMENSIONS ────────────────────────
+function getDims() {
+  const isMobile = window.innerWidth < 600;
+  const W = Math.min(window.innerWidth - (isMobile ? 0 : 40), isMobile ? window.innerWidth : 520);
+  const H = isMobile ? Math.min(window.innerHeight - 60, 640) : 600;
+  return { W, H, isMobile, scale: W / 480 };
+}
+
+// ── COLORS ────────────────────────────────────────
+const THEMES = [
+  { name: "CYBER",   bg: "#050812", grid: "#0D1525", accent: "#00F5FF", accent2: "#FF00FF", ground: "#00F5FF" },
+  { name: "INFERNO", bg: "#120502", grid: "#251008", accent: "#FF6B00", accent2: "#FF0000", ground: "#FF6B00" },
+  { name: "FOREST",  bg: "#030F05", grid: "#0A1F0C", accent: "#00FF88", accent2: "#AAFF00", ground: "#00FF88" },
+  { name: "GALAXY",  bg: "#08050F", grid: "#150D25", accent: "#CC00FF", accent2: "#FF00AA", ground: "#CC00FF" },
+];
+const C = { gold: "#FFD700", red: "#FF3A3A", white: "#E8F4FF", dark: "#080E1A", muted: "#3A5070", orange: "#FF8C00", purple: "#9B59FF", lime: "#AAFF00" };
+
+// ── AUDIO ENGINE ──────────────────────────────────
+class AudioEngine {
+  constructor() { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch { this.ctx = null; } }
+  resume() { if (this.ctx?.state === "suspended") this.ctx.resume(); }
+  tone(freq, dur = 0.08, type = "square", vol = 0.12, delay = 0) {
+    if (!this.ctx) return;
+    try {
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.connect(g); g.connect(this.ctx.destination);
+      o.type = type; o.frequency.value = freq;
+      const t = this.ctx.currentTime + delay;
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      o.start(t); o.stop(t + dur);
+    } catch { }
+  }
+  jump()   { this.tone(520, 0.1, "square", 0.1); this.tone(660, 0.08, "square", 0.08, 0.06); }
+  dJump()  { this.tone(780, 0.1, "square", 0.12); this.tone(980, 0.08, "square", 0.1, 0.06); }
+  coin()   { this.tone(880, 0.06, "sine", 0.1); this.tone(1100, 0.06, "sine", 0.1, 0.06); }
+  power()  { [440,550,660,880].forEach((f,i) => this.tone(f, 0.08, "sine", 0.1, i*0.06)); }
+  hit()    { this.tone(120, 0.2, "sawtooth", 0.15); this.tone(80, 0.3, "square", 0.1, 0.1); }
+  die()    { [440,330,220,110].forEach((f,i) => this.tone(f, 0.15, "sawtooth", 0.12, i*0.1)); }
+  levelUp(){ [660,880,1100,1320].forEach((f,i) => this.tone(f, 0.1, "sine", 0.12, i*0.08)); }
+  milestone(){ [523,659,784,1047].forEach((f,i) => this.tone(f, 0.12, "sine", 0.13, i*0.07)); }
+}
+const audio = new AudioEngine();
+
+// ── UTILS ─────────────────────────────────────────
+function glow(ctx, color, blur = 16) { ctx.shadowColor = color; ctx.shadowBlur = blur; }
+function noGlow(ctx) { ctx.shadowBlur = 0; }
+function rr(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y);
+  ctx.quadraticCurveTo(x+w,y,x+w,y+r); ctx.lineTo(x+w,y+h-r);
+  ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); ctx.lineTo(x+r,y+h);
+  ctx.quadraticCurveTo(x,y+h,x,y+h-r); ctx.lineTo(x,y+r);
+  ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+}
+function mkP(x,y,color,speed=5) {
+  return { id:Math.random(), x, y, color, vx:(Math.random()-0.5)*speed, vy:(Math.random()-2)*speed, life:1, size:3+Math.random()*5 };
+}
+function lerp(a,b,t){ return a+(b-a)*t; }
+
+// ── CONSTANTS ─────────────────────────────────────
+const PLAYER_W=36, PLAYER_H=46, DUCK_H=24;
+const GRAVITY=0.55, JUMP=-13.5, D_JUMP=-12;
+const BASE_SPD=5, COIN_SIZE=18;
+
+const OBS_TYPES = [
+  { h:48, w:28, color:"#FF3A3A", glow:"#FF3A3A", shape:"rect",    label:"SPIKE",   fly:false },
+  { h:72, w:22, color:"#9B59FF", glow:"#9B59FF", shape:"tall",    label:"LASER",   fly:false },
+  { h:30, w:54, color:"#FF8C00", glow:"#FF8C00", shape:"wide",    label:"WALL",    fly:false },
+  { h:40, w:30, color:"#FF00FF", glow:"#FF00FF", shape:"diamond", label:"MINE",    fly:false },
+  { h:32, w:32, color:"#FF3A3A", glow:"#FF3A3A", shape:"rect",    label:"FLYER",   fly:true  },
+  { h:20, w:80, color:"#00F5FF", glow:"#00F5FF", shape:"beam",    label:"BEAM",    fly:true  },
+];
+const PWR_TYPES = [
+  { type:"shield", color:"#00F5FF", glow:"#00F5FF", icon:"🛡", dur:5000, label:"SHIELD"    },
+  { type:"magnet", color:C.gold,    glow:C.gold,    icon:"🧲", dur:6000, label:"MAGNET"    },
+  { type:"slow",   color:C.lime,    glow:C.lime,    icon:"⏱", dur:4000, label:"SLOW TIME" },
+  { type:"x2",     color:C.orange,  glow:C.orange,  icon:"×2", dur:6000, label:"×2 COINS" },
+  { type:"ghost",  color:"#AAAAFF", glow:"#AAAAFF", icon:"👻", dur:3000, label:"GHOST"     },
+  { type:"rocket", color:C.red,     glow:C.red,     icon:"🚀", dur:4000, label:"ROCKET"    },
+];
+const ACHIEVEMENTS = [
+  { id:"first",    label:"FIRST RUN",      desc:"Complete your first run",        icon:"🎯", check: s => s.gamesPlayed >= 1        },
+  { id:"score100", label:"CENTURION",      desc:"Score 100 in one run",            icon:"💯", check: s => s.bestScore >= 100        },
+  { id:"score500", label:"LEGEND",         desc:"Score 500 in one run",            icon:"🏆", check: s => s.bestScore >= 500        },
+  { id:"coins50",  label:"COIN HUNTER",   desc:"Collect 50 coins in one run",     icon:"🪙", check: s => s.mostCoins >= 50         },
+  { id:"combo10",  label:"COMBO KING",    desc:"Get a 10x coin combo",            icon:"⚡", check: s => s.bestCombo >= 10         },
+  { id:"power5",   label:"POWER ADDICT",  desc:"Collect 5 power-ups in one run",  icon:"⚗️", check: s => s.mostPowers >= 5         },
+  { id:"streak3",  label:"ON A ROLL",     desc:"Play 3 days in a row",            icon:"🔥", check: s => s.dayStreak >= 3          },
+  { id:"total500", label:"GRINDER",       desc:"Score 500 total across all runs",  icon:"🎖", check: s => s.totalScore >= 500       },
+];
+const SKINS = [
+  { name:"CYBER",   color:"#00F5FF", glow:"#00F5FF", price:0    },
+  { name:"PHANTOM", color:"#9B59FF", glow:"#9B59FF", price:150  },
+  { name:"INFERNO", color:"#FF6B00", glow:"#FF6B00", price:200  },
+  { name:"GOLD",    color:C.gold,    glow:C.gold,    price:500  },
+  { name:"TOXIC",   color:C.lime,    glow:C.lime,    price:300  },
+  { name:"PINK",    color:"#FF69B4", glow:"#FF69B4", price:250  },
+];
+const DAILY_CHALLENGES = [
+  { label:"Score 200+",       check:(s,c) => s >= 200,          reward: 80  },
+  { label:"Collect 30 coins", check:(s,c) => c >= 30,           reward: 60  },
+  { label:"Score 100+",       check:(s,c) => s >= 100,          reward: 40  },
+  { label:"Score 50+",        check:(s,c) => s >= 50,           reward: 25  },
+];
+
+// ═══════════════════════════════════════════════════
+// MAIN GAME
+// ═══════════════════════════════════════════════════
+export default function NeonDash() {
+  const canvasRef = useRef(null);
+  const gsRef = useRef(null);
+  const rafRef = useRef(null);
+  const dims = useRef(getDims());
+
+  const [screen, setScreen] = useState("menu");
+  const [score, setScore] = useState(0);
+  const [coins, setCoins] = useState(0);
+  const [combo, setCombo] = useState(0);
+  const [level, setLevel] = useState(1);
+  const [activePwr, setActivePwr] = useState(null);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+
+  // Persistent state
+  const [totalCoins, setTotalCoins] = useState(() => parseInt(localStorage.getItem("nd_coins")||"0")||0);
+  const [bestScore, setBestScore] = useState(() => parseInt(localStorage.getItem("nd_best")||"0")||0);
+  const [leaderboard, setLeaderboard] = useState(() => JSON.parse(localStorage.getItem("nd_lb")||"[]"));
+  const [unlockedAch, setUnlockedAch] = useState(() => JSON.parse(localStorage.getItem("nd_ach")||"[]"));
+  const [purchasedSkins, setPurchasedSkins] = useState(() => JSON.parse(localStorage.getItem("nd_skins")||"[0]"));
+  const [equippedSkin, setEquippedSkin] = useState(() => parseInt(localStorage.getItem("nd_skin")||"0")||0);
+  const [equippedTheme, setEquippedTheme] = useState(0);
+  const [stats, setStats] = useState(() => JSON.parse(localStorage.getItem("nd_stats")||"{}"));
+  const [dailyDone, setDailyDone] = useState(() => JSON.parse(localStorage.getItem("nd_daily")||"[]"));
+  const [newAch, setNewAch] = useState(null);
+  const [showAd, setShowAd] = useState(false);
+  const [adCallback, setAdCallback] = useState(null);
+
+  const { W, H, isMobile, scale } = dims.current;
+  const GROUND_Y = H - (isMobile ? 70 : 80);
+  const theme = THEMES[equippedTheme];
+  const skinColor = SKINS[equippedSkin].color;
+  const skinGlow  = SKINS[equippedSkin].glow;
+
+  // ── SAVE ──────────────────────────────────────
+  const save = useCallback((key, val) => { try { localStorage.setItem(key, typeof val === "object" ? JSON.stringify(val) : String(val)); } catch{} }, []);
+
+  // ── CHECK ACHIEVEMENTS ────────────────────────
+  const checkAch = useCallback((newStats) => {
+    const nowUnlocked = [...unlockedAch];
+    ACHIEVEMENTS.forEach(a => {
+      if (!nowUnlocked.includes(a.id) && a.check(newStats)) {
+        nowUnlocked.push(a.id);
+        setNewAch(a);
+        audio.levelUp();
+        setTimeout(() => setNewAch(null), 3000);
+      }
+    });
+    if (nowUnlocked.length !== unlockedAch.length) {
+      setUnlockedAch(nowUnlocked);
+      save("nd_ach", nowUnlocked);
+    }
+  }, [unlockedAch, save]);
+
+  // ── INIT GAME STATE ───────────────────────────
+  const initState = useCallback(() => {
+    const GY = GROUND_Y;
+    return {
+      player: { x:80, y:GY-PLAYER_H, vy:0, onGround:true, jumps:0, ducking:false, shielded:false, ghost:false, rocket:false, trail:[], invincible:0 },
+      obstacles:[], coins:[], powerUps:[], particles:[], floatTexts:[],
+      stars: Array.from({length:70}, ()=>({ x:Math.random()*W, y:Math.random()*(GY*0.8), r:Math.random()*1.8+0.3, speed:Math.random()*0.5+0.2, bright:Math.random() })),
+      score:0, coinCount:0, speed:BASE_SPD, frame:0,
+      obsTimer:0, coinTimer:0, pwrTimer:0,
+      combo:0, comboTimer:0, maxCombo:0,
+      power:null, powerEnd:0, powerCount:0,
+      level:1, levelScore:0,
+      dead:false, bgOff:0, groundOff:0,
+      GY, W, H,
+    };
+  }, [GROUND_Y, W, H]);
+
+  // ── JUMP / DUCK ───────────────────────────────
+  const jump = useCallback(() => {
+    if (screen !== "playing" || pausedRef.current) return;
+    audio.resume();
+    const p = gsRef.current?.player;
+    if (!p) return;
+    if (p.ducking) { p.ducking = false; return; }
+    if (p.onGround) { p.vy = JUMP; p.onGround = false; p.jumps = 1; audio.jump(); }
+    else if (p.jumps < 2) { p.vy = D_JUMP; p.jumps = 2; audio.dJump(); }
+  }, [screen]);
+
+  const duck = useCallback(() => {
+    if (screen !== "playing" || pausedRef.current) return;
+    const p = gsRef.current?.player;
+    if (p && p.onGround) p.ducking = true;
+  }, [screen]);
+
+  const togglePause = useCallback(() => {
+    if (screen !== "playing") return;
+    pausedRef.current = !pausedRef.current;
+    setPaused(p => !p);
+  }, [screen]);
+
+  // ── START GAME ────────────────────────────────
+  const startGame = useCallback(() => {
+    audio.resume();
+    gsRef.current = initState();
+    setScreen("playing");
+    setScore(0); setCoins(0); setCombo(0); setLevel(1);
+    setActivePwr(null); pausedRef.current = false; setPaused(false);
+  }, [initState]);
+
+  // ── INPUT HANDLING ────────────────────────────
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code==="Space"||e.code==="ArrowUp") { e.preventDefault(); jump(); }
+      if (e.code==="ArrowDown") { e.preventDefault(); duck(); }
+      if (e.code==="Escape"||e.code==="KeyP") togglePause();
+    };
+    let touchStartY = 0, touchStartX = 0;
+    const onTouchStart = (e) => { touchStartY = e.touches[0].clientY; touchStartX = e.touches[0].clientX; };
+    const onTouchEnd = (e) => {
+      const dy = touchStartY - e.changedTouches[0].clientY;
+      const dx = Math.abs(e.changedTouches[0].clientX - touchStartX);
+      if (dy > 30 && dx < 60) jump();
+      else if (dy < -30 && dx < 60) duck();
+      else if (dx < 20 && Math.abs(dy) < 20) jump();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("touchstart", onTouchStart, {passive:true});
+    window.addEventListener("touchend", onTouchEnd, {passive:true});
+    return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("touchstart", onTouchStart); window.removeEventListener("touchend", onTouchEnd); };
+  }, [jump, duck, togglePause]);
+
+  // ── FLOAT TEXT ────────────────────────────────
+  function addFloat(gs, x, y, text, color) {
+    gs.floatTexts.push({ x, y, text, color, life:1, vy:-1.5, id:Math.random() });
+  }
+
+  // ── GAME LOOP ─────────────────────────────────
+  useEffect(() => {
+    if (screen !== "playing") { cancelAnimationFrame(rafRef.current); return; }
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+
+    const loop = () => {
+      const gs = gsRef.current;
+      if (!gs || gs.dead) return;
+      if (pausedRef.current) { rafRef.current = requestAnimationFrame(loop); return; }
+
+      // Speed & level
+      gs.frame++;
+      const spd = gs.power==="slow" ? gs.speed*0.45 : gs.power==="rocket" ? gs.speed*1.8 : gs.speed;
+      gs.score += 0.1;
+      gs.levelScore += 0.1;
+      gs.speed = BASE_SPD + gs.score * 0.005;
+      gs.bgOff = (gs.bgOff + spd * 0.25) % W;
+      gs.groundOff = (gs.groundOff + spd) % 54;
+
+      // Level up every 100 pts
+      const newLevel = Math.floor(gs.score / 100) + 1;
+      if (newLevel > gs.level) { gs.level = newLevel; audio.levelUp(); setLevel(newLevel); addFloat(gs, W/2, gs.GY-120, `LEVEL ${newLevel}!`, "#AAFF00"); }
+
+      // Power timer
+      if (gs.power && Date.now() > gs.powerEnd) {
+        gs.power = null; gs.player.shielded = false; gs.player.ghost = false; gs.player.rocket = false;
+        setActivePwr(null);
+      }
+
+      // Combo decay
+      if (gs.comboTimer > 0) gs.comboTimer--; else gs.combo = 0;
+      if (gs.invincible > 0) gs.invincible--;
+
+      // ── PLAYER ─────────────────────────────────
+      const pl = gs.player;
+      const pH = pl.ducking ? DUCK_H : PLAYER_H;
+      pl.vy += GRAVITY;
+      if (pl.rocket) pl.vy = Math.min(pl.vy, -2);
+      pl.y += pl.vy;
+      const groundY = gs.GY - pH;
+      if (pl.y >= groundY) { pl.y = groundY; pl.vy = 0; pl.onGround = true; pl.jumps = 0; if (pl.ducking && pl.vy===0) pl.ducking = false; }
+      // Trail
+      pl.trail.push({ x:pl.x+PLAYER_W/2, y:pl.y+pH/2 });
+      if (pl.trail.length > 12) pl.trail.shift();
+
+      // ── OBSTACLES ──────────────────────────────
+      gs.obsTimer++;
+      const obsInt = Math.max(45, 110 - gs.score*0.12 - gs.level*3);
+      if (gs.obsTimer > obsInt) {
+        gs.obsTimer = 0;
+        const t = OBS_TYPES[Math.floor(Math.random()*OBS_TYPES.length)];
+        const flyY = t.fly ? gs.GY - 120 - Math.random()*60 : gs.GY - t.h;
+        gs.obstacles.push({ x:W+20, y:flyY, ...t, id:Math.random() });
+        // Double obstacle at high speed
+        if (gs.speed > 8 && Math.random() > 0.6) {
+          const t2 = OBS_TYPES[Math.floor(Math.random()*OBS_TYPES.length)];
+          const fy2 = t2.fly ? gs.GY-120-Math.random()*60 : gs.GY-t2.h;
+          gs.obstacles.push({ x:W+140, y:fy2, ...t2, id:Math.random() });
+        }
+      }
+      gs.obstacles = gs.obstacles.filter(o => {
+        o.x -= spd; if (o.x+o.w < 0) return false;
+        const mg=6, invOk = gs.invincible>0||pl.ghost;
+        if (!pl.shielded && !invOk &&
+          pl.x+mg < o.x+o.w && pl.x+PLAYER_W-mg > o.x &&
+          pl.y+mg < o.y+o.h && pl.y+pH-mg > o.y) {
+          for(let i=0;i<20;i++) gs.particles.push(mkP(pl.x+PLAYER_W/2,pl.y+pH/2,skinColor,7));
+          audio.hit(); gs.lives--;
+          gs.invincible = 90; pl.shielded = false; pl.ghost = false; gs.power = null; setActivePwr(null);
+          if (gs.lives<=0) {
+            gs.dead = true;
+            const fs=Math.floor(gs.score), fc=gs.coinCount;
+            audio.die();
+            const newBest = Math.max(bestScore, fs);
+            setBestScore(newBest); save("nd_best", newBest);
+            setTotalCoins(t => { const v=t+fc; save("nd_coins",v); return v; });
+            const lb = [...leaderboard, { score:fs, date:new Date().toLocaleDateString() }]
+              .sort((a,b)=>b.score-a.score).slice(0,10);
+            setLeaderboard(lb); save("nd_lb", lb);
+            // Stats
+            const ns = { ...stats, gamesPlayed:(stats.gamesPlayed||0)+1, bestScore:newBest, mostCoins:Math.max(stats.mostCoins||0,fc), bestCombo:Math.max(stats.bestCombo||0,gs.maxCombo), mostPowers:Math.max(stats.mostPowers||0,gs.powerCount), totalScore:(stats.totalScore||0)+fs };
+            setStats(ns); save("nd_stats",ns); checkAch(ns);
+            // Daily challenge
+            const today = new Date().toDateString();
+            const ch = DAILY_CHALLENGES[new Date().getDate()%DAILY_CHALLENGES.length];
+            const dd = JSON.parse(localStorage.getItem("nd_daily")||"[]");
+            if (!dd.includes(today) && ch.check(fs,fc)) {
+              dd.push(today); setDailyDone(dd); save("nd_daily",dd);
+              setTotalCoins(t => { const v=t+ch.reward; save("nd_coins",v); return v; });
+              addFloat(gs,W/2,gs.GY-150,`DAILY! +${ch.reward}¢`,C.gold);
+            }
+            setScreen("dead"); return false;
+          }
+          return false;
+        }
+        return true;
+      });
+
+      // ── COINS ───────────────────────────────────
+      gs.coinTimer++;
+      if (gs.coinTimer > 22) {
+        gs.coinTimer = 0;
+        if (Math.random()>0.3) {
+          const ln = Math.random();
+          const cy = ln<0.4?gs.GY-30:ln<0.7?gs.GY-100:gs.GY-180;
+          const count = Math.random()>0.7 ? 3 : 1;
+          for(let i=0;i<count;i++) gs.coins.push({x:W+10+i*30,y:cy,id:Math.random()});
+        }
+      }
+      gs.coins = gs.coins.filter(coin => {
+        if (gs.power==="magnet") {
+          const dx=pl.x+PLAYER_W/2-(coin.x+COIN_SIZE/2), dy=pl.y+pH/2-(coin.y+COIN_SIZE/2);
+          const dist=Math.sqrt(dx*dx+dy*dy);
+          if (dist<180) { coin.x+=dx*0.12; coin.y+=dy*0.12; }
+        }
+        coin.x-=spd; if(coin.x+COIN_SIZE<0) return false;
+        if(pl.x+4<coin.x+COIN_SIZE&&pl.x+PLAYER_W-4>coin.x&&pl.y+4<coin.y+COIN_SIZE&&pl.y+pH-4>coin.y) {
+          const val=gs.power==="x2"?2:1;
+          gs.coinCount+=val; gs.combo++; gs.comboTimer=70;
+          gs.maxCombo=Math.max(gs.maxCombo,gs.combo);
+          for(let i=0;i<8;i++) gs.particles.push(mkP(coin.x,coin.y,C.gold,4));
+          addFloat(gs,coin.x,coin.y,gs.power==="x2"?"+2¢":"+1¢",C.gold);
+          if(gs.combo>=5) addFloat(gs,coin.x,coin.y-20,`×${gs.combo} COMBO!`,C.orange);
+          audio.coin(); setCoins(gs.coinCount); setCombo(gs.combo);
+          return false;
+        }
+        return true;
+      });
+
+      // ── POWER-UPS ──────────────────────────────
+      gs.pwrTimer++;
+      if (gs.pwrTimer > 250) {
+        gs.pwrTimer = 0;
+        if (Math.random()>0.4) {
+          const pt=PWR_TYPES[Math.floor(Math.random()*PWR_TYPES.length)];
+          gs.powerUps.push({ x:W+10, y:gs.GY-150, ...pt, id:Math.random() });
+        }
+      }
+      gs.powerUps = gs.powerUps.filter(pu => {
+        pu.x-=spd; if(pu.x+32<0) return false;
+        if(pl.x<pu.x+32&&pl.x+PLAYER_W>pu.x&&pl.y<pu.y+32&&pl.y+pH>pu.y) {
+          gs.power=pu.type; gs.powerEnd=Date.now()+pu.dur;
+          pl.shielded=pu.type==="shield"; pl.ghost=pu.type==="ghost"; pl.rocket=pu.type==="rocket";
+          gs.powerCount++; setActivePwr({...pu});
+          for(let i=0;i<16;i++) gs.particles.push(mkP(pu.x+16,pu.y+16,pu.color,6));
+          addFloat(gs,pu.x,pu.y-10,pu.label,pu.color);
+          audio.power(); return false;
+        }
+        return true;
+      });
+
+      // ── PARTICLES ──────────────────────────────
+      gs.particles=gs.particles.filter(p => { p.x+=p.vx;p.y+=p.vy;p.vy+=0.18;p.life-=0.035; return p.life>0; });
+
+      // ── FLOAT TEXTS ─────────────────────────────
+      gs.floatTexts=gs.floatTexts.filter(ft => { ft.y+=ft.vy;ft.life-=0.025; return ft.life>0; });
+
+      // ── STARS ───────────────────────────────────
+      
